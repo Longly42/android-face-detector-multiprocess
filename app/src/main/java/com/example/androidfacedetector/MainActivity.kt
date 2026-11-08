@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Typeface
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -18,10 +20,19 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,7 +41,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -38,6 +51,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.androidfacedetector.detector.DetectResult
 import com.example.androidfacedetector.detector.ScrfdDetector
+import com.example.androidfacedetector.face.FaceAligner
+import com.example.androidfacedetector.face.FaceDatabase
+import com.example.androidfacedetector.face.FaceEmbedder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -45,6 +61,21 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.min
+
+/**
+ * 一帧的完整处理结果：检测 + 识别。
+ * @param name       识别到的名字；null 表示"库为空"或"相似度没过阈值"
+ * @param similarity 与库中最相似者的余弦相似度
+ * @param feature    最大那张脸的特征，注册时直接用，不用再算一遍
+ */
+class FrameResult(
+    val detect: DetectResult,
+    val name: String?,
+    val similarity: Float,
+    val feature: FloatArray?,
+    val alignMs: Float,
+    val embedMs: Float
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -59,8 +90,8 @@ class MainActivity : ComponentActivity() {
 fun CameraScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val focusManager = LocalFocusManager.current
 
-    // ---------- 各种状态 ----------
     var hasPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
@@ -69,20 +100,28 @@ fun CameraScreen() {
     }
     var statusText by remember { mutableStateOf("准备请求权限...") }
     var detector by remember { mutableStateOf<ScrfdDetector?>(null) }
-    var result by remember { mutableStateOf<DetectResult?>(null) }
-    var frameW by remember { mutableIntStateOf(0) }   // 分析帧的宽（摆正后）
-    var frameH by remember { mutableIntStateOf(0) }   // 分析帧的高
+    var embedder by remember { mutableStateOf<FaceEmbedder?>(null) }
+    var frameResult by remember { mutableStateOf<FrameResult?>(null) }
+    var frameW by remember { mutableIntStateOf(0) }
+    var frameH by remember { mutableIntStateOf(0) }
     var fps by remember { mutableIntStateOf(0) }
 
-    val frameCounter = remember { AtomicInteger(0) }
-    val busy = remember { AtomicBoolean(false) }      // 推理没做完就跳过新帧（第5周换成 Semaphore）
-    val mainExecutor = remember { ContextCompat.getMainExecutor(context) }
+    // 注册相关
+    var nameInput by remember { mutableStateOf("") }
+    var hint by remember { mutableStateOf("") }
+    var registered by remember { mutableStateOf(listOf<String>()) }
 
+    val frameCounter = remember { AtomicInteger(0) }
+    val busy = remember { AtomicBoolean(false) }
+    val mainExecutor = remember { ContextCompat.getMainExecutor(context) }
     val cameraExecutor = remember {
         Executors.newSingleThreadExecutor { r -> Thread(r, "cam-analysis") }
     }
 
-    // 每秒刷新 FPS
+    val database = remember {
+        FaceDatabase(context).also { registered = it.names() }
+    }
+
     LaunchedEffect(Unit) {
         while (true) {
             delay(1000)
@@ -90,34 +129,40 @@ fun CameraScreen() {
         }
     }
 
-    // 加载模型：只做一次，放到 IO 线程，别卡住界面
+    // 进界面时别让输入框抢焦点，不然键盘会弹出来挡住底部注册区
+    LaunchedEffect(Unit) { focusManager.clearFocus() }
+
+    // 两个模型一起加载，都在 IO 线程，别卡界面
     LaunchedEffect(Unit) {
-        statusText = "正在加载人脸检测模型..."
-        val loaded = withContext(Dispatchers.IO) {
+        statusText = "正在加载模型..."
+        val t0 = System.nanoTime()
+        val pair = withContext(Dispatchers.IO) {
             try {
-                ScrfdDetector(context)
+                ScrfdDetector(context) to FaceEmbedder(context)
             } catch (t: Throwable) {
                 Log.e("CameraDebug", "模型加载失败", t)
                 null
             }
         }
-        if (loaded != null) {
-            detector = loaded
-            statusText = "模型已就绪"
+        if (pair != null) {
+            detector = pair.first
+            embedder = pair.second
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            statusText = "检测+识别模型已就绪 (${ms}ms)"
+            hint = "请输入姓名后点注册"
         } else {
-            statusText = "模型加载失败：检查 assets/${ScrfdDetector.DEFAULT_MODEL}"
+            statusText = "模型加载失败：检查 assets/ 下的 onnx 文件"
         }
     }
 
-    // 界面销毁时收掉线程和模型
     DisposableEffect(Unit) {
         onDispose {
             cameraExecutor.shutdown()
             detector?.close()
+            embedder?.close()
         }
     }
 
-    // ---------- 权限 ----------
     val launcher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = { granted ->
@@ -133,13 +178,11 @@ fun CameraScreen() {
         }
     }
 
-    // ---------- 界面 ----------
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         if (hasPermission) {
             AndroidView(
                 factory = { ctx ->
                     val previewView = PreviewView(ctx).apply {
-                        // FIT_CENTER：画面完整不裁剪，和下面的画框坐标能对上
                         scaleType = PreviewView.ScaleType.FIT_CENTER
                     }
 
@@ -162,11 +205,12 @@ fun CameraScreen() {
                                 frameCounter.incrementAndGet()
 
                                 val d = detector
-                                if (d != null && busy.compareAndSet(false, true)) {
+                                val e = embedder
+                                if (d != null && e != null && busy.compareAndSet(false, true)) {
                                     try {
-                                        val r = d.detect(bitmap)
+                                        val fr = recognize(bitmap, d, e, database)
                                         mainExecutor.execute {
-                                            result = r
+                                            frameResult = fr
                                             frameW = bitmap.width
                                             frameH = bitmap.height
                                         }
@@ -202,47 +246,171 @@ fun CameraScreen() {
             )
         }
 
-        // 人脸框 + 关键点
-        DetectionOverlay(result, frameW, frameH)
+        FaceOverlay(frameResult, frameW, frameH)
 
         // 左上角信息面板
         Column(modifier = Modifier.align(Alignment.TopStart).padding(16.dp)) {
             Text(text = statusText, color = Color.Green, fontSize = 13.sp)
             Text(text = "FPS: $fps", color = Color.Yellow, fontSize = 13.sp)
-            result?.let { r ->
+            frameResult?.let { fr ->
+                val r = fr.detect
                 Text(text = "人脸: ${r.detections.size}", color = Color.White, fontSize = 13.sp)
-                r.detections.firstOrNull()?.let {
-                    Text(text = "置信度: ${"%.2f".format(it.score)}", color = Color.White, fontSize = 13.sp)
+                r.largest()?.let { d ->
+                    Text(
+                        text = "置信度 ${"%.2f".format(d.score)}",
+                        color = Color.White,
+                        fontSize = 13.sp
+                    )
+                }
+                // 识别结论
+                val who = when {
+                    fr.feature == null -> "—"
+                    database.size == 0 -> "库为空，未注册"
+                    fr.name != null -> "识别: ${fr.name}  ${"%.2f".format(fr.similarity)}"
+                    else -> "未知身份  ${"%.2f".format(fr.similarity)}"
                 }
                 Text(
-                    text = "预处理 ${"%.1f".format(r.preMs)}ms  " +
-                            "推理 ${"%.1f".format(r.inferMs)}ms  " +
-                            "后处理 ${"%.1f".format(r.postMs)}ms",
-                    color = Color.Cyan,
-                    fontSize = 12.sp
+                    text = who,
+                    color = if (fr.name != null) Color(0xFF00E676) else Color(0xFFFFD54F),
+                    fontSize = 15.sp
                 )
+                Text(
+                    text = "预处理 ${"%.1f".format(r.preMs)}  推理 ${"%.1f".format(r.inferMs)}  " +
+                            "后处理 ${"%.1f".format(r.postMs)}  |  " +
+                            "对齐 ${"%.1f".format(fr.alignMs)}  特征 ${"%.1f".format(fr.embedMs)}",
+                    color = Color.Cyan,
+                    fontSize = 11.sp
+                )
+            }
+        }
+
+        // 底部：注册区
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .padding(16.dp)
+                .background(Color(0xCC000000), RoundedCornerShape(12.dp))
+                .padding(12.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = nameInput,
+                    onValueChange = { nameInput = it },
+                    label = { Text("姓名", fontSize = 12.sp) },
+                    singleLine = true,
+                    modifier = Modifier.width(140.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedLabelColor = Color.Cyan,
+                        unfocusedLabelColor = Color.LightGray,
+                        cursorColor = Color.White,
+                        focusedBorderColor = Color.Cyan,
+                        unfocusedBorderColor = Color.Gray
+                    )
+                )
+                Button(
+                    onClick = {
+                        val feat = frameResult?.feature
+                        if (feat == null) {
+                            hint = "画面里还没有人脸，先把脸对准摄像头"
+                        } else if (nameInput.isBlank()) {
+                            hint = "请先输入姓名"
+                        } else {
+                            database.register(nameInput, feat)
+                            registered = database.names()
+                            hint = "已注册 ${nameInput.trim()}，共 ${database.size} 人"
+                            focusManager.clearFocus()
+                        }
+                    }
+                ) { Text("注册当前人脸", fontSize = 12.sp) }
+
+                OutlinedButton(
+                    onClick = {
+                        database.clear()
+                        registered = emptyList()
+                        hint = "特征库已清空"
+                    }
+                ) { Text("清空", fontSize = 12.sp) }
+            }
+            Text(
+                text = if (registered.isEmpty()) "已注册：无" else "已注册：${registered.joinToString("、")}",
+                color = Color.LightGray,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+            if (hint.isNotEmpty()) {
+                Text(text = hint, color = Color(0xFFFFD54F), fontSize = 12.sp)
             }
         }
     }
 }
 
 /**
- * 把检测框画在预览上面。
- * 坐标换算：预览用 FIT_CENTER，所以按"等比缩放 + 居中"算出偏移量，和预览完全重合。
+ * 检测 + 识别一条龙。跑在摄像头分析线程上。
+ */
+private fun recognize(
+    bitmap: Bitmap,
+    detector: ScrfdDetector,
+    embedder: FaceEmbedder,
+    database: FaceDatabase
+): FrameResult {
+    val r = detector.detect(bitmap)
+    val face = r.largest() ?: return FrameResult(r, null, 0f, null, 0f, 0f)
+
+    val t0 = System.nanoTime()
+    val aligned = FaceAligner.align(bitmap, face.landmarks)
+    val t1 = System.nanoTime()
+    val feature = embedder.embed(aligned)
+    val t2 = System.nanoTime()
+
+    val m = database.match(feature)
+    val name = if (m != null && m.similarity >= FaceEmbedder.MATCH_THRESHOLD) m.name else null
+
+    return FrameResult(
+        detect = r,
+        name = name,
+        similarity = m?.similarity ?: 0f,
+        feature = feature,
+        alignMs = (t1 - t0) / 1_000_000f,
+        embedMs = (t2 - t1) / 1_000_000f
+    )
+}
+
+/**
+ * 把检测框、关键点、识别名字画在预览上面。
+ * 坐标换算：预览用 FIT_CENTER，所以按"等比缩放 + 居中"算偏移，和预览完全重合。
  */
 @Composable
-fun DetectionOverlay(result: DetectResult?, frameW: Int, frameH: Int) {
+fun FaceOverlay(fr: FrameResult?, frameW: Int, frameH: Int) {
+    val textPaint = remember {
+        Paint().apply {
+            isAntiAlias = true
+            typeface = Typeface.DEFAULT_BOLD
+            textSize = 38f
+            setShadowLayer(4f, 0f, 0f, android.graphics.Color.BLACK)
+        }
+    }
     Canvas(modifier = Modifier.fillMaxSize()) {
-        val r = result ?: return@Canvas
+        val res = fr ?: return@Canvas
         if (frameW <= 0 || frameH <= 0) return@Canvas
 
         val scale = min(size.width / frameW, size.height / frameH)
         val dx = (size.width - frameW * scale) / 2f
         val dy = (size.height - frameH * scale) / 2f
+        val largest = res.detect.largest()
 
-        r.detections.forEach { d ->
+        res.detect.detections.forEach { d ->
+            val isMatched = (d === largest) && res.name != null
+            val boxColor =
+                if (isMatched) Color(0xFF00E676) else Color(0xFFFFA726)
+
             drawRect(
-                color = Color(0xFF00E676),
+                color = boxColor,
                 topLeft = Offset(dx + d.x1 * scale, dy + d.y1 * scale),
                 size = Size(d.width * scale, d.height * scale),
                 style = Stroke(width = 4f)
@@ -257,13 +425,26 @@ fun DetectionOverlay(result: DetectResult?, frameW: Int, frameH: Int) {
                 i += 2
             }
         }
+
+        // 名字标签画在最大那张脸的框上方
+        if (largest != null) {
+            val label = when {
+                res.name != null -> "${res.name}  ${"%.2f".format(res.similarity)}"
+                res.feature == null -> ""
+                else -> "未知  ${"%.2f".format(res.similarity)}"
+            }
+            if (label.isNotEmpty()) {
+                textPaint.color = if (res.name != null) 0xFF00E676.toInt() else 0xFFFFA726.toInt()
+                val x = dx + largest.x1 * scale
+                val y = (dy + largest.y1 * scale - 12f).coerceAtLeast(40f)
+                drawContext.canvas.nativeCanvas.drawText(label, x, y, textPaint)
+            }
+        }
     }
 }
 
 /** ImageProxy（生的 YUV 帧）→ 摆正 + 镜像后的 Bitmap */
 fun ImageProxy.toUprightBitmap(mirror: Boolean): Bitmap {
-    // toBitmap() 是 CameraX 1.3 自带的：帮我们把 YUV 转成图片
-    // 如果这里报红：光标放上去按 Alt+Enter 自动导入
     val src = toBitmap()
 
     val matrix = Matrix()

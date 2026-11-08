@@ -61,7 +61,17 @@ adb shell am start -n com.example.androidfacedetector/.MainActivity
 - 左上角信息面板：FPS、人脸数、最高置信度、预处理 / 推理 / 后处理三段耗时
 - Logcat 打印模型体检信息（输入输出名称与形状），便于排查。
 
-Logcat 过滤关键字：`Scrfd`、`CameraDebug`。
+Logcat 过滤关键字：`Scrfd`、`FaceEmbedder`、`FaceDatabase`、`CameraDebug`。
+
+### 人脸注册与识别
+
+- 5 点对齐：按 ArcFace 标准模板做相似变换 + 双线性采样，输出 112×112 摆正人脸
+- MobileFaceNet 提取 512 维特征并 L2 归一化，余弦相似度比对，阈值 0.5
+- 底部注册区：输入姓名 → 点"注册当前人脸"，把画面中最大那张脸存进特征库
+- 特征库只存向量不存照片，持久化在应用私有目录 `filesDir/faces.bin`，可一键清空
+- 识别结果叠加在画面：绿框 + 姓名 + 相似度；未过阈值显示"未知"，库为空时不报错
+
+阈值标定与相似度实测数据见 [`MODELS.md`](MODELS.md)。
 
 ---
 
@@ -70,14 +80,23 @@ Logcat 过滤关键字：`Scrfd`、`CameraDebug`。
 ```
 app/src/main/
 ├── assets/
-│   └── scrfd_500m_bnkps_shape640x640.onnx     # SCRFD-500M-KPS，输入固定 640x640
+│   ├── scrfd_500m_bnkps_shape640x640.onnx     # SCRFD-500M-KPS，输入固定 640x640
+│   └── w600k_mbf_112x112.onnx                 # MobileFaceNet，输入固定 112x112
 └── java/com/example/androidfacedetector/
-    ├── MainActivity.kt                        # 权限、相机绑定、检测调度、结果叠加、HUD
-    └── detector/
-        ├── Detection.kt                       # 检测结果数据结构（框/关键点/置信度/三段耗时）
-        └── ScrfdDetector.kt                   # 预处理 → 推理 → 锚点解码 → NMS
-MODELS.md                                      # 模型来源、许可、输入输出规格、转换方式
+    ├── MainActivity.kt                        # 权限、相机绑定、检测+识别调度、叠加层、注册 UI
+    ├── detector/
+    │   ├── Detection.kt                       # 检测结果数据结构（框/关键点/置信度/三段耗时）
+    │   └── ScrfdDetector.kt                   # 预处理 → 推理 → 锚点解码 → NMS
+    └── face/
+        ├── FaceAligner.kt                     # 5 点相似变换对齐到 112x112
+        ├── FaceEmbedder.kt                    # MobileFaceNet 特征提取 + 余弦相似度
+        └── FaceDatabase.kt                    # 特征库：注册 / 匹配 / 持久化
+MODELS.md                                      # 模型来源、许可、输入输出规格、转换方式、阈值标定
 ```
+
+`app/src/androidTest/` 下有一个端侧一致性测试，用于核对 Kotlin 实现与 PC 端 Python
+参考实现的输出是否一致。测试图片不入库，需自备放入 `androidTest/assets/t1.jpg`，
+缺图时自动跳过。
 
 ---
 
@@ -88,7 +107,7 @@ MODELS.md                                      # 模型来源、许可、输入�
 | 模型 | 用途 | 体积 | 状态 |
 |---|---|---|---|
 | SCRFD-500M-KPS | 人脸检测 + 5 关键点 | 2.5 MB | 已集成 |
-| MobileFaceNet (`w600k_mbf`) | 人脸特征提取（512 维） | 13.6 MB | 待集成 |
+| MobileFaceNet (`w600k_mbf`) | 人脸特征提取（512 维） | 13.6 MB | 已集成 |
 | MiniFASNetV2 | 活体检测 | 待定 | 待集成 |
 
 ---
@@ -98,7 +117,9 @@ MODELS.md                                      # 模型来源、许可、输入�
 - **单进程单线程推理**：推理当前运行在摄像头分析线程（`cam-analysis`）内，尚未拆分独立推理线程，也未引入 Binder IPC。双进程与 Semaphore 限流按计划在第 5 周实施。
 - **帧调度为临时方案**：使用 `STRATEGY_KEEP_ONLY_LATEST` + `AtomicBoolean` 防重入，语义等价于「在途任务数 = 1」，尚未使用信号量。
 - **每帧全量推理**：无跳帧策略，真机帧率约 13–25 FPS。
-- **APK 体积 89.8 MB**：ONNX Runtime 默认打包 4 种 ABI 的 so。发布版可通过 `abiFilters` 仅保留 `arm64-v8a` 降至约 30 MB。
+- **APK 体积 102 MB**：ONNX Runtime 默认打包 4 种 ABI 的 so，加上两个模型共 16 MB。发布版可通过 `abiFilters` 仅保留 `arm64-v8a` 降至约 40 MB。
+- **每帧都做"检测 + 对齐 + 特征"**：识别模型每帧重算，耗时随之增加。第 7 周会做跳帧与缓存对照实验。
+- **对齐在 Kotlin 层逐像素采样**：模拟器上 7~20 ms，真机会明显更快，但仍是可优化点（可改 RenderScript/NEON 或直接交给 OpenCV）。
 - **未做量化**：当前为 FP32 模型，INT8 / FP16 与线程数对照实验在第 7 周进行。
 - **模拟器无真人脸**：虚拟摄像头为合成场景，检测结果恒为 0，属预期行为。
 
@@ -109,7 +130,7 @@ MODELS.md                                      # 模型来源、许可、输入�
 | 周次 | 任务 | 状态 |
 |---|---|---|
 | 1–2 | 前摄采集、格式转换、SCRFD 检测与结果展示 | 完成 |
-| 3 | 5 点对齐 + 特征提取 + 注册 / 识别 / 拒识 | 进行中 |
+| 3 | 5 点对齐 + 特征提取 + 注册 / 识别 / 拒识 | 完成 |
 | 4 | 活体检测 + 三模型串联流水线 | 待开始 |
 | 5 | AIDL 双进程 + Executor + Semaphore + 调试页 | 待开始 |
 | 6 | 摄像头 I/O 事件链埋点 + Trace 分析 | 待开始 |
