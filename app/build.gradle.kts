@@ -56,4 +56,6 @@ dependencies {
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
+    // ONNX Runtime：在手机上跑 .onnx 模型的官方推理库
+    implementation(libs.onnxruntime.android)
 }
