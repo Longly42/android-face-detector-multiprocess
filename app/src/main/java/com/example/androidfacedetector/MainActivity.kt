@@ -51,6 +51,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.androidfacedetector.detector.DetectResult
 import com.example.androidfacedetector.detector.ScrfdDetector
+import com.example.androidfacedetector.face.AntiSpoofDetector
 import com.example.androidfacedetector.face.FaceAligner
 import com.example.androidfacedetector.face.FaceDatabase
 import com.example.androidfacedetector.face.FaceEmbedder
@@ -63,13 +64,16 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.min
 
 /**
- * 一帧的完整处理结果：检测 + 识别。
- * @param name       识别到的名字；null 表示"库为空"或"相似度没过阈值"
- * @param similarity 与库中最相似者的余弦相似度
- * @param feature    最大那张脸的特征，注册时直接用，不用再算一遍
+ * 一帧的完整处理结果：检测 -> 活体 -> 识别。
+ *
+ * 三段流水线的语义：
+ *  - spoof.isReal == false：判为翻拍（照片/屏幕），出于安全考虑直接不出识别结果
+ *  - feature == null：活体通过但画面里没有脸
+ *  - name == null && feature != null：活体通过、有脸，但库里没有匹配（或库为空）
  */
 class FrameResult(
     val detect: DetectResult,
+    val spoof: AntiSpoofDetector.Result,
     val name: String?,
     val similarity: Float,
     val feature: FloatArray?,
@@ -101,12 +105,12 @@ fun CameraScreen() {
     var statusText by remember { mutableStateOf("准备请求权限...") }
     var detector by remember { mutableStateOf<ScrfdDetector?>(null) }
     var embedder by remember { mutableStateOf<FaceEmbedder?>(null) }
+    var spoofer by remember { mutableStateOf<AntiSpoofDetector?>(null) }
     var frameResult by remember { mutableStateOf<FrameResult?>(null) }
     var frameW by remember { mutableIntStateOf(0) }
     var frameH by remember { mutableIntStateOf(0) }
     var fps by remember { mutableIntStateOf(0) }
 
-    // 注册相关
     var nameInput by remember { mutableStateOf("") }
     var hint by remember { mutableStateOf("") }
     var registered by remember { mutableStateOf(listOf<String>()) }
@@ -132,23 +136,26 @@ fun CameraScreen() {
     // 进界面时别让输入框抢焦点，不然键盘会弹出来挡住底部注册区
     LaunchedEffect(Unit) { focusManager.clearFocus() }
 
-    // 两个模型一起加载，都在 IO 线程，别卡界面
+    // 三个模型一起加载，都在 IO 线程，别卡界面
     LaunchedEffect(Unit) {
-        statusText = "正在加载模型..."
-        val t0 = System.nanoTime()
-        val pair = withContext(Dispatchers.IO) {
+        statusText = "正在加载模型（检测/活体/识别）..."
+        val loaded = withContext(Dispatchers.IO) {
             try {
-                ScrfdDetector(context) to FaceEmbedder(context)
+                Triple(
+                    ScrfdDetector(context),
+                    AntiSpoofDetector(context),
+                    FaceEmbedder(context)
+                )
             } catch (t: Throwable) {
                 Log.e("CameraDebug", "模型加载失败", t)
                 null
             }
         }
-        if (pair != null) {
-            detector = pair.first
-            embedder = pair.second
-            val ms = (System.nanoTime() - t0) / 1_000_000
-            statusText = "检测+识别模型已就绪 (${ms}ms)"
+        if (loaded != null) {
+            detector = loaded.first
+            spoofer = loaded.second
+            embedder = loaded.third
+            statusText = "三个模型已就绪"
             hint = "请输入姓名后点注册"
         } else {
             statusText = "模型加载失败：检查 assets/ 下的 onnx 文件"
@@ -159,6 +166,7 @@ fun CameraScreen() {
         onDispose {
             cameraExecutor.shutdown()
             detector?.close()
+            spoofer?.close()
             embedder?.close()
         }
     }
@@ -205,10 +213,13 @@ fun CameraScreen() {
                                 frameCounter.incrementAndGet()
 
                                 val d = detector
+                                val s = spoofer
                                 val e = embedder
-                                if (d != null && e != null && busy.compareAndSet(false, true)) {
+                                if (d != null && s != null && e != null &&
+                                    busy.compareAndSet(false, true)
+                                ) {
                                     try {
-                                        val fr = recognize(bitmap, d, e, database)
+                                        val fr = recognize(bitmap, d, s, e, database)
                                         mainExecutor.execute {
                                             frameResult = fr
                                             frameW = bitmap.width
@@ -255,28 +266,33 @@ fun CameraScreen() {
             frameResult?.let { fr ->
                 val r = fr.detect
                 Text(text = "人脸: ${r.detections.size}", color = Color.White, fontSize = 13.sp)
-                r.largest()?.let { d ->
+                // 活体结论
+                val liveness = if (fr.spoof.isReal)
+                    "活体: 通过  ${"%.2f".format(fr.spoof.score)}"
+                else
+                    "活体: 未通过(疑似翻拍)  ${"%.2f".format(fr.spoof.score)}"
+                Text(
+                    text = liveness,
+                    color = if (fr.spoof.isReal) Color(0xFF00E676) else Color(0xFFEF5350),
+                    fontSize = 14.sp
+                )
+                // 识别结论：活体没过就不出识别结果
+                if (fr.spoof.isReal) {
+                    val who = when {
+                        fr.feature == null -> "—"
+                        database.size == 0 -> "库为空，未注册"
+                        fr.name != null -> "识别: ${fr.name}  ${"%.2f".format(fr.similarity)}"
+                        else -> "未知身份  ${"%.2f".format(fr.similarity)}"
+                    }
                     Text(
-                        text = "置信度 ${"%.2f".format(d.score)}",
-                        color = Color.White,
-                        fontSize = 13.sp
+                        text = who,
+                        color = if (fr.name != null) Color(0xFF00E676) else Color(0xFFFFD54F),
+                        fontSize = 15.sp
                     )
                 }
-                // 识别结论
-                val who = when {
-                    fr.feature == null -> "—"
-                    database.size == 0 -> "库为空，未注册"
-                    fr.name != null -> "识别: ${fr.name}  ${"%.2f".format(fr.similarity)}"
-                    else -> "未知身份  ${"%.2f".format(fr.similarity)}"
-                }
                 Text(
-                    text = who,
-                    color = if (fr.name != null) Color(0xFF00E676) else Color(0xFFFFD54F),
-                    fontSize = 15.sp
-                )
-                Text(
-                    text = "预处理 ${"%.1f".format(r.preMs)}  推理 ${"%.1f".format(r.inferMs)}  " +
-                            "后处理 ${"%.1f".format(r.postMs)}  |  " +
+                    text = "检测 ${"%.1f".format(r.preMs)}/${"%.1f".format(r.inferMs)}/${"%.1f".format(r.postMs)}  " +
+                            "活体 ${"%.1f".format(fr.spoof.inferMs)}  " +
                             "对齐 ${"%.1f".format(fr.alignMs)}  特征 ${"%.1f".format(fr.embedMs)}",
                     color = Color.Cyan,
                     fontSize = 11.sp
@@ -317,7 +333,7 @@ fun CameraScreen() {
                     onClick = {
                         val feat = frameResult?.feature
                         if (feat == null) {
-                            hint = "画面里还没有人脸，先把脸对准摄像头"
+                            hint = "画面里还没有通过活体检测的人脸"
                         } else if (nameInput.isBlank()) {
                             hint = "请先输入姓名"
                         } else {
@@ -351,16 +367,29 @@ fun CameraScreen() {
 }
 
 /**
- * 检测 + 识别一条龙。跑在摄像头分析线程上。
+ * 检测 -> 活体 -> 识别 一条龙。跑在摄像头分析线程上。
+ *
+ * 活体没通过时直接短路返回，不做对齐和特征提取——
+ * 一来省算力，二来安全语义清晰：翻拍的脸不允许进入注册/识别环节。
  */
 private fun recognize(
     bitmap: Bitmap,
     detector: ScrfdDetector,
+    spoof: AntiSpoofDetector,
     embedder: FaceEmbedder,
     database: FaceDatabase
 ): FrameResult {
     val r = detector.detect(bitmap)
-    val face = r.largest() ?: return FrameResult(r, null, 0f, null, 0f, 0f)
+    val face = r.largest()
+        ?: return FrameResult(
+            r, AntiSpoofDetector.Result(true, 0f, 0f, 0f),
+            null, 0f, null, 0f, 0f
+        )
+
+    val sp = spoof.detect(bitmap, face.x1, face.y1, face.x2, face.y2)
+    if (!sp.isReal) {
+        return FrameResult(r, sp, null, 0f, null, 0f, 0f)
+    }
 
     val t0 = System.nanoTime()
     val aligned = FaceAligner.align(bitmap, face.landmarks)
@@ -373,6 +402,7 @@ private fun recognize(
 
     return FrameResult(
         detect = r,
+        spoof = sp,
         name = name,
         similarity = m?.similarity ?: 0f,
         feature = feature,
@@ -382,8 +412,8 @@ private fun recognize(
 }
 
 /**
- * 把检测框、关键点、识别名字画在预览上面。
- * 坐标换算：预览用 FIT_CENTER，所以按"等比缩放 + 居中"算偏移，和预览完全重合。
+ * 把检测框、关键点、活体与识别结论画在预览上面。
+ * 颜色语义：活体通过且识别到 = 绿；活体通过未识别 = 橙；活体未通过 = 红。
  */
 @Composable
 fun FaceOverlay(fr: FrameResult?, frameW: Int, frameH: Int) {
@@ -405,9 +435,12 @@ fun FaceOverlay(fr: FrameResult?, frameW: Int, frameH: Int) {
         val largest = res.detect.largest()
 
         res.detect.detections.forEach { d ->
-            val isMatched = (d === largest) && res.name != null
-            val boxColor =
-                if (isMatched) Color(0xFF00E676) else Color(0xFFFFA726)
+            val isLargest = d === largest
+            val boxColor = when {
+                isLargest && !res.spoof.isReal -> Color(0xFFEF5350)   // 红：非活体
+                isLargest && res.name != null -> Color(0xFF00E676)    // 绿：已识别
+                else -> Color(0xFFFFA726)                             // 橙：未识别
+            }
 
             drawRect(
                 color = boxColor,
@@ -426,15 +459,19 @@ fun FaceOverlay(fr: FrameResult?, frameW: Int, frameH: Int) {
             }
         }
 
-        // 名字标签画在最大那张脸的框上方
         if (largest != null) {
             val label = when {
+                !res.spoof.isReal -> "疑似翻拍  ${"%.2f".format(res.spoof.score)}"
                 res.name != null -> "${res.name}  ${"%.2f".format(res.similarity)}"
                 res.feature == null -> ""
                 else -> "未知  ${"%.2f".format(res.similarity)}"
             }
             if (label.isNotEmpty()) {
-                textPaint.color = if (res.name != null) 0xFF00E676.toInt() else 0xFFFFA726.toInt()
+                textPaint.color = when {
+                    !res.spoof.isReal -> 0xFFEF5350.toInt()
+                    res.name != null -> 0xFF00E676.toInt()
+                    else -> 0xFFFFA726.toInt()
+                }
                 val x = dx + largest.x1 * scale
                 val y = (dy + largest.y1 * scale - 12f).coerceAtLeast(40f)
                 drawContext.canvas.nativeCanvas.drawText(label, x, y, textPaint)

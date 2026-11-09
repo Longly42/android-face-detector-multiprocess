@@ -61,7 +61,7 @@ adb shell am start -n com.example.androidfacedetector/.MainActivity
 - 左上角信息面板：FPS、人脸数、最高置信度、预处理 / 推理 / 后处理三段耗时
 - Logcat 打印模型体检信息（输入输出名称与形状），便于排查。
 
-Logcat 过滤关键字：`Scrfd`、`FaceEmbedder`、`FaceDatabase`、`CameraDebug`。
+Logcat 过滤关键字：`Scrfd`、`AntiSpoof`、`FaceEmbedder`、`FaceDatabase`、`CameraDebug`。
 
 ### 人脸注册与识别
 
@@ -72,6 +72,13 @@ Logcat 过滤关键字：`Scrfd`、`FaceEmbedder`、`FaceDatabase`、`CameraDebu
 - 识别结果叠加在画面：绿框 + 姓名 + 相似度；未过阈值显示"未知"，库为空时不报错
 
 阈值标定与相似度实测数据见 [`MODELS.md`](MODELS.md)。
+
+### 活体检测（三模型串联流水线）
+
+- MiniFASNetV2（scale 2.7）+ MiniFASNetV1SE（scale 4.0）双模型融合，判定沿用官方 argmax==1 规则
+- 活体未通过时直接短路：不做对齐和特征提取，翻拍的脸不允许进入注册/识别环节
+- 颜色语义：活体通过且识别到 = 绿框；活体通过未识别 = 橙框；判为翻拍 = 红框 + "疑似翻拍"
+- 官方三张样例图判定全部与官方一致，端侧与 PC 端分数差 < 0.002（见 MODELS.md 标定表）
 
 ---
 
@@ -90,7 +97,8 @@ app/src/main/
     └── face/
         ├── FaceAligner.kt                     # 5 点相似变换对齐到 112x112
         ├── FaceEmbedder.kt                    # MobileFaceNet 特征提取 + 余弦相似度
-        └── FaceDatabase.kt                    # 特征库：注册 / 匹配 / 持久化
+        ├── FaceDatabase.kt                    # 特征库：注册 / 匹配 / 持久化
+        └── AntiSpoofDetector.kt               # 活体检测：MiniFASNet 双模型融合
 MODELS.md                                      # 模型来源、许可、输入输出规格、转换方式、阈值标定
 ```
 
@@ -108,7 +116,7 @@ MODELS.md                                      # 模型来源、许可、输入�
 |---|---|---|---|
 | SCRFD-500M-KPS | 人脸检测 + 5 关键点 | 2.5 MB | 已集成 |
 | MobileFaceNet (`w600k_mbf`) | 人脸特征提取（512 维） | 13.6 MB | 已集成 |
-| MiniFASNetV2 | 活体检测 | 待定 | 待集成 |
+| MiniFASNetV2 + V1SE | 活体检测（双模型融合） | 1.74 MB ×2 | 已集成 |
 
 ---
 
@@ -117,7 +125,7 @@ MODELS.md                                      # 模型来源、许可、输入�
 - **单进程单线程推理**：推理当前运行在摄像头分析线程（`cam-analysis`）内，尚未拆分独立推理线程，也未引入 Binder IPC。双进程与 Semaphore 限流按计划在第 5 周实施。
 - **帧调度为临时方案**：使用 `STRATEGY_KEEP_ONLY_LATEST` + `AtomicBoolean` 防重入，语义等价于「在途任务数 = 1」，尚未使用信号量。
 - **每帧全量推理**：无跳帧策略，真机帧率约 13–25 FPS。
-- **APK 体积 102 MB**：ONNX Runtime 默认打包 4 种 ABI 的 so，加上两个模型共 16 MB。发布版可通过 `abiFilters` 仅保留 `arm64-v8a` 降至约 40 MB。
+- **APK 体积 105 MB**：ONNX Runtime 默认打包 4 种 ABI 的 so，加上四个模型共约 19 MB。发布版可通过 `abiFilters` 仅保留 `arm64-v8a` 降至约 45 MB。
 - **每帧都做"检测 + 对齐 + 特征"**：识别模型每帧重算，耗时随之增加。第 7 周会做跳帧与缓存对照实验。
 - **对齐在 Kotlin 层逐像素采样**：模拟器上 7~20 ms，真机会明显更快，但仍是可优化点（可改 RenderScript/NEON 或直接交给 OpenCV）。
 - **未做量化**：当前为 FP32 模型，INT8 / FP16 与线程数对照实验在第 7 周进行。
@@ -131,7 +139,7 @@ MODELS.md                                      # 模型来源、许可、输入�
 |---|---|---|
 | 1–2 | 前摄采集、格式转换、SCRFD 检测与结果展示 | 完成 |
 | 3 | 5 点对齐 + 特征提取 + 注册 / 识别 / 拒识 | 完成 |
-| 4 | 活体检测 + 三模型串联流水线 | 待开始 |
+| 4 | 活体检测 + 三模型串联流水线 | 完成 |
 | 5 | AIDL 双进程 + Executor + Semaphore + 调试页 | 待开始 |
 | 6 | 摄像头 I/O 事件链埋点 + Trace 分析 | 待开始 |
 | 7 | 量化 / 线程数 / 跳帧对照实验 | 待开始 |
