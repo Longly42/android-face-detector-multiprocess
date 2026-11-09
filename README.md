@@ -4,7 +4,7 @@
 
 Android 端完全离线运行三个深度学习模型，并围绕这一真实负载分析进程、线程、IPC、同步与 I/O 调度行为。
 
-当前进度：**第 2 周完成**（前摄预览 + 帧转换 + SCRFD 人脸检测已跑通）。识别与活体模块、双进程 IPC、性能实验按周推进，见文末「进度」。
+当前进度：**第 7 周完成**。三项 AI 功能、双进程 Binder 架构、信号量限流、调试页、事件链埋点与优化对照实验均已实现并实测，见 [`EXPERIMENT.md`](EXPERIMENT.md)。
 
 ---
 
@@ -18,7 +18,7 @@ Android 端完全离线运行三个深度学习模型，并围绕这一真实负
 | Android Gradle Plugin | 9.5.1 |
 | Kotlin | 2.2.10 |
 | compileSdk / targetSdk | 37 |
-| minSdk | 26（Android 8.0） |
+| minSdk | 27（Android 8.1，跨进程传帧使用 `SharedMemory`） |
 | 设备 | 需带**前置摄像头**。真机优先；模拟器可验证流程，但虚拟摄像头无真人脸，检测结果恒为 0 |
 
 首次构建需要联网下载依赖（主要是 ONNX Runtime Android，约 20 MB）。
@@ -61,7 +61,7 @@ adb shell am start -n com.example.androidfacedetector/.MainActivity
 - 左上角信息面板：FPS、人脸数、最高置信度、预处理 / 推理 / 后处理三段耗时
 - Logcat 打印模型体检信息（输入输出名称与形状），便于排查。
 
-Logcat 过滤关键字：`Scrfd`、`AntiSpoof`、`FaceEmbedder`、`FaceDatabase`、`CameraDebug`。
+Logcat 过滤关键字：`Scrfd`、`AntiSpoof`、`FaceEmbedder`、`FaceDatabase`、`FaceClient`、`InferenceService`、`Metrics`、`CameraDebug`。
 
 ### 人脸注册与识别
 
@@ -80,26 +80,73 @@ Logcat 过滤关键字：`Scrfd`、`AntiSpoof`、`FaceEmbedder`、`FaceDatabase`
 - 颜色语义：活体通过且识别到 = 绿框；活体通过未识别 = 橙框；判为翻拍 = 红框 + "疑似翻拍"
 - 官方三张样例图判定全部与官方一致，端侧与 PC 端分数差 < 0.002（见 MODELS.md 标定表）
 
+### 双进程架构与系统状态页
+
+- 主进程负责采集与 UI，`:inference` 进程负责三个模型与特征库，通过 AIDL + Binder 通信
+- 帧数据走 **共享内存（ashmem）**：Binder 事务体里只有一个 fd，不走 1.2MB 的像素拷贝
+- 推理进程用 **线程池 + Semaphore** 控制并发额度，取不到许可立即返回 DROPPED 作为背压信号
+- 右上角「调试」进入系统状态页，实时显示两个进程的 PID、线程列表与 tid、IPC 调用次数与时延、
+  可用许可/在途任务/队列长度/已处理/丢弃/超时、平均与最大排队、单帧耗时
+- 状态页可在线切换：单进程/双进程、线程池 1/2/4、许可数 1/2/4、检测分辨率 640/320、跳帧 1/2/4，
+  并提供「并发压测」「崩溃服务」「导出CSV」用于实验与故障验证
+
+### 实验数据采集
+
+```bash
+# 帧级数据（每帧一行，含各阶段耗时与状态）
+adb shell run-as com.example.androidfacedetector ls files/metrics/
+adb exec-out run-as com.example.androidfacedetector cat files/metrics/xxx.csv > data.csv
+python tools/analyze_metrics.py data.csv
+
+# 系统 Trace（自定义埋点：frame.convert / ipc.analyze / infer.* / svc.*）
+adb shell atrace -t 5 -a com.example.androidfacedetector sched view gfx binder_driver -b 8192 > trace.txt
+python tools/analyze_trace.py trace.txt
+```
+
 ---
 
 ## 四、目录结构
 
 ```
 app/src/main/
+├── aidl/com/example/androidfacedetector/ipc/
+│   ├── IFaceInference.aidl                    # 主进程 -> 推理进程的 Binder 接口
+│   ├── FaceResultParcel.aidl
+│   └── ServiceStatsParcel.aidl
 ├── assets/
-│   ├── scrfd_500m_bnkps_shape640x640.onnx     # SCRFD-500M-KPS，输入固定 640x640
-│   └── w600k_mbf_112x112.onnx                 # MobileFaceNet，输入固定 112x112
+│   ├── scrfd_500m_bnkps_shape640x640.onnx     # 检测，输入 640（默认）
+│   ├── scrfd_500m_bnkps_shape320x320.onnx     # 检测，输入 320（分辨率对照实验）
+│   ├── antispoof_minifasnetv2_80x80.onnx      # 活体，输入 80（scale 2.7）
+│   ├── antispoof_minifasnetv1se_80x80.onnx    # 活体，输入 80（scale 4.0）
+│   └── w600k_mbf_112x112.onnx                 # 识别，输入 112
 └── java/com/example/androidfacedetector/
-    ├── MainActivity.kt                        # 权限、相机绑定、检测+识别调度、叠加层、注册 UI
+    ├── MainActivity.kt                        # 权限、相机绑定、帧调度、叠加层、注册 UI
+    ├── DebugScreen.kt                         # 系统状态/调试覆盖层（PID/TID/队列/许可/耗时）
+    ├── FaceApp.kt                             # 全局 EngineRouter 持有者
     ├── detector/
-    │   ├── Detection.kt                       # 检测结果数据结构（框/关键点/置信度/三段耗时）
+    │   ├── Detection.kt                       # 检测结果数据结构
     │   └── ScrfdDetector.kt                   # 预处理 → 推理 → 锚点解码 → NMS
-    └── face/
-        ├── FaceAligner.kt                     # 5 点相似变换对齐到 112x112
-        ├── FaceEmbedder.kt                    # MobileFaceNet 特征提取 + 余弦相似度
-        ├── FaceDatabase.kt                    # 特征库：注册 / 匹配 / 持久化
-        └── AntiSpoofDetector.kt               # 活体检测：MiniFASNet 双模型融合
-MODELS.md                                      # 模型来源、许可、输入输出规格、转换方式、阈值标定
+    ├── face/
+    │   ├── FaceAligner.kt                     # 5 点相似变换对齐到 112x112
+    │   ├── FaceEmbedder.kt                    # MobileFaceNet 特征提取 + 余弦相似度
+    │   ├── FaceDatabase.kt                    # 特征库：注册 / 匹配 / 持久化
+    │   └── AntiSpoofDetector.kt               # 活体检测：MiniFASNet 双模型融合
+    ├── inference/
+    │   ├── InferenceEngine.kt                 # 三模型 + 特征库（单/双进程共用）
+    │   ├── InferenceService.kt                # :inference 进程的 Binder 服务 + 线程池 + 信号量
+    │   └── EngineRouter.kt                    # 单进程/双进程切换、跳帧、配置标签
+    ├── ipc/
+    │   ├── FaceClient.kt                      # 主进程侧 Binder 客户端（连接/重连/IPC 统计）
+    │   ├── SharedFrameBuffer.kt               # ashmem 帧缓冲
+    │   ├── FaceResultParcel.kt                # 手写 Parcelable
+    │   └── ServiceStatsParcel.kt
+    └── perf/
+        └── Metrics.kt                          # 时延统计（avg/P50/P95）与帧事件记录/CSV 导出
+tools/
+├── analyze_metrics.py                          # 解析帧级 CSV，按模式/状态输出 P50/P95
+└── analyze_trace.py                            # 解析 atrace，统计埋点耗时并还原单帧事件链
+MODELS.md                                       # 模型来源、许可、规格、转换方式、阈值标定
+EXPERIMENT.md                                   # 实验报告：架构、IPC、信号量、事件链、优化对照
 ```
 
 `app/src/androidTest/` 下有一个端侧一致性测试，用于核对 Kotlin 实现与 PC 端 Python
@@ -122,13 +169,14 @@ MODELS.md                                      # 模型来源、许可、输入�
 
 ## 六、已知限制
 
-- **单进程单线程推理**：推理当前运行在摄像头分析线程（`cam-analysis`）内，尚未拆分独立推理线程，也未引入 Binder IPC。双进程与 Semaphore 限流按计划在第 5 周实施。
-- **帧调度为临时方案**：使用 `STRATEGY_KEEP_ONLY_LATEST` + `AtomicBoolean` 防重入，语义等价于「在途任务数 = 1」，尚未使用信号量。
-- **每帧全量推理**：无跳帧策略，真机帧率约 13–25 FPS。
-- **APK 体积 105 MB**：ONNX Runtime 默认打包 4 种 ABI 的 so，加上四个模型共约 19 MB。发布版可通过 `abiFilters` 仅保留 `arm64-v8a` 降至约 45 MB。
-- **每帧都做"检测 + 对齐 + 特征"**：识别模型每帧重算，耗时随之增加。第 7 周会做跳帧与缓存对照实验。
-- **对齐在 Kotlin 层逐像素采样**：模拟器上 7~20 ms，真机会明显更快，但仍是可优化点（可改 RenderScript/NEON 或直接交给 OpenCV）。
-- **未做量化**：当前为 FP32 模型，INT8 / FP16 与线程数对照实验在第 7 周进行。
+- **性能数据来自模拟器**（x86_64 + 软件渲染），不能代表真机；真机需按 `EXPERIMENT.md` 第 7.1 节条件重测。
+- **精度未量化评估**：缺少带标注测试集，识别与活体只有定性结论与阈值标定数据。
+- **单相机场景下 Semaphore 不会自然触发**：CameraX 的 Analyzer 是串行回调，天然只有 1 帧在途；
+  压测数据来自调试页的并发压测入口，与真实使用存在差距。
+- **检测分辨率 320 有精度代价**：最小可检人脸尺寸翻倍，远处小脸会漏检，未做检出率对比。
+- **帧转换是当前最大瓶颈**：`ImageProxy.toBitmap()` 是纯 Java 实现，模拟器上约 48ms（占端到端一半）。
+- **特征库为单文件二进制**：设计上保证同一时刻只有一个引擎实例持有，未做文件锁。
+- **APK 体积**：debug 包 105 MB（ONNX Runtime 含 4 种 ABI 的 so + 19 MB 模型）；release 包已用 `abiFilters` 裁到 `arm64-v8a`，为 **48.3 MB**（见 `app/build.gradle.kts`）。
 - **模拟器无真人脸**：虚拟摄像头为合成场景，检测结果恒为 0，属预期行为。
 
 ---
@@ -140,7 +188,7 @@ MODELS.md                                      # 模型来源、许可、输入�
 | 1–2 | 前摄采集、格式转换、SCRFD 检测与结果展示 | 完成 |
 | 3 | 5 点对齐 + 特征提取 + 注册 / 识别 / 拒识 | 完成 |
 | 4 | 活体检测 + 三模型串联流水线 | 完成 |
-| 5 | AIDL 双进程 + Executor + Semaphore + 调试页 | 待开始 |
-| 6 | 摄像头 I/O 事件链埋点 + Trace 分析 | 待开始 |
-| 7 | 量化 / 线程数 / 跳帧对照实验 | 待开始 |
-| 8 | 清理、打包、报告与答辩材料 | 待开始 |
+| 5 | AIDL 双进程 + Executor + Semaphore + 调试页 | 完成 |
+| 6 | 摄像头 I/O 事件链埋点 + Trace 分析 | 完成 |
+| 7 | 分辨率 / 跳帧 / 线程数对照实验 | 完成（模拟器数据） |
+| 8 | 清理、打包、报告与答辩材料 | 报告完成，PPT 另做 |

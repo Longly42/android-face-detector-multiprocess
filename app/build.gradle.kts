@@ -22,10 +22,20 @@ android {
 
     buildTypes {
         release {
+            // 关闭 R8 代码裁剪：AIDL 生成的 Stub 与手写 Parcelable 的 CREATOR
+            // 依赖反射式实例化，裁剪后一旦缺规则会在运行期才崩，而本项目缺少
+            // arm64 真机做验收，因此这里只做 ABI 裁剪，不冒险做代码优化。
             optimization {
-                enable = true
-                packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
+                enable = false
             }
+            // 交付用：ONNX Runtime 默认把 4 种 ABI 的 so 都打进来（约 80MB），
+            // 真机基本都是 arm64，裁掉其余三种可省一半体积。
+            // 注意：只含 arm64-v8a，x86_64 模拟器装不上，调试仍用 debug 包。
+            ndk {
+                abiFilters += listOf("arm64-v8a")
+            }
+            // 用 debug 签名，保证产物可直接 adb install 演示；正式发布应换成自己的 keystore
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
