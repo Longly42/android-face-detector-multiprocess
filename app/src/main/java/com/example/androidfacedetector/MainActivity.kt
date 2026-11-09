@@ -7,6 +7,7 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Trace
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -49,44 +50,25 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import com.example.androidfacedetector.detector.DetectResult
-import com.example.androidfacedetector.detector.ScrfdDetector
-import com.example.androidfacedetector.face.AntiSpoofDetector
-import com.example.androidfacedetector.face.FaceAligner
-import com.example.androidfacedetector.face.FaceDatabase
-import com.example.androidfacedetector.face.FaceEmbedder
-import kotlinx.coroutines.Dispatchers
+import com.example.androidfacedetector.inference.EngineRouter
+import com.example.androidfacedetector.inference.RunMode
+import com.example.androidfacedetector.ipc.FaceClient
+import com.example.androidfacedetector.ipc.FaceResultParcel
+import com.example.androidfacedetector.perf.FrameEvent
+import com.example.androidfacedetector.perf.LatencyStats
+import com.example.androidfacedetector.perf.MetricsRecorder
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
-
-/**
- * 一帧的完整处理结果：检测 -> 活体 -> 识别。
- *
- * 三段流水线的语义：
- *  - spoof.isReal == false：判为翻拍（照片/屏幕），出于安全考虑直接不出识别结果
- *  - feature == null：活体通过但画面里没有脸
- *  - name == null && feature != null：活体通过、有脸，但库里没有匹配（或库为空）
- */
-class FrameResult(
-    val detect: DetectResult,
-    val spoof: AntiSpoofDetector.Result,
-    val name: String?,
-    val similarity: Float,
-    val feature: FloatArray?,
-    val alignMs: Float,
-    val embedMs: Float
-)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent {
-            CameraScreen()
-        }
+        setContent { CameraScreen() }
     }
 }
 
@@ -95,6 +77,7 @@ fun CameraScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val focusManager = LocalFocusManager.current
+    val router = (context.applicationContext as FaceApp).router
 
     var hasPermission by remember {
         mutableStateOf(
@@ -103,71 +86,74 @@ fun CameraScreen() {
         )
     }
     var statusText by remember { mutableStateOf("准备请求权限...") }
-    var detector by remember { mutableStateOf<ScrfdDetector?>(null) }
-    var embedder by remember { mutableStateOf<FaceEmbedder?>(null) }
-    var spoofer by remember { mutableStateOf<AntiSpoofDetector?>(null) }
-    var frameResult by remember { mutableStateOf<FrameResult?>(null) }
+    var connText by remember { mutableStateOf("未连接") }
+    var svcPid by remember { mutableIntStateOf(-1) }
+    var frameResult by remember { mutableStateOf<FaceResultParcel?>(null) }
     var frameW by remember { mutableIntStateOf(0) }
     var frameH by remember { mutableIntStateOf(0) }
     var fps by remember { mutableIntStateOf(0) }
+    var e2eAvg by remember { mutableFloatStateOf(0f) }
+    var e2eP95 by remember { mutableFloatStateOf(0f) }
 
+    var showDebug by remember { mutableStateOf(false) }
     var nameInput by remember { mutableStateOf("") }
     var hint by remember { mutableStateOf("") }
     var registered by remember { mutableStateOf(listOf<String>()) }
 
     val frameCounter = remember { AtomicInteger(0) }
+    val reqSeq = remember { AtomicLong(0) }
     val busy = remember { AtomicBoolean(false) }
     val mainExecutor = remember { ContextCompat.getMainExecutor(context) }
+    // 采集/调用线程池：放大到 3 个线程，才能让多帧同时进入 Binder，
+    // 从而真正触发推理进程的 Semaphore 限流与丢帧（单线程时永远只有 1 帧在途）
+    val camThreadIdx = AtomicInteger(0)
     val cameraExecutor = remember {
-        Executors.newSingleThreadExecutor { r -> Thread(r, "cam-analysis") }
+        Executors.newFixedThreadPool(3) { r ->
+            Thread(r, "cam-analysis-${camThreadIdx.getAndIncrement()}")
+        }
     }
-
-    val database = remember {
-        FaceDatabase(context).also { registered = it.names() }
-    }
+    val e2eStats = remember { LatencyStats() }
+    // 最近一帧，注册时要用（分析线程写、UI 线程读）
+    val lastFrame = remember { AtomicReference<Bitmap?>(null) }
 
     LaunchedEffect(Unit) {
         while (true) {
             delay(1000)
             fps = frameCounter.getAndSet(0)
+            e2eAvg = e2eStats.avg()
+            e2eP95 = e2eStats.percentile(0.95f)
         }
     }
 
-    // 进界面时别让输入框抢焦点，不然键盘会弹出来挡住底部注册区
     LaunchedEffect(Unit) { focusManager.clearFocus() }
 
-    // 三个模型一起加载，都在 IO 线程，别卡界面
-    LaunchedEffect(Unit) {
-        statusText = "正在加载模型（检测/活体/识别）..."
-        val loaded = withContext(Dispatchers.IO) {
-            try {
-                Triple(
-                    ScrfdDetector(context),
-                    AntiSpoofDetector(context),
-                    FaceEmbedder(context)
-                )
-            } catch (t: Throwable) {
-                Log.e("CameraDebug", "模型加载失败", t)
-                null
+    DisposableEffect(Unit) {
+        router.listener = object : FaceClient.Listener {
+            override fun onServiceConnected(pid: Int) {
+                mainExecutor.execute {
+                    svcPid = pid
+                    connText = "已连接 :inference  pid=$pid"
+                    registered = runCatching { router.names() }.getOrDefault(emptyList())
+                }
+            }
+
+            override fun onServiceDisconnected(reason: String) {
+                mainExecutor.execute {
+                    svcPid = -1
+                    connText = "断开：$reason"
+                }
+                // 自动重连：稍等再 bind，避免服务还没重启就绑失败
+                cameraExecutor.execute {
+                    Thread.sleep(800)
+                    runCatching { router.setMode(RunMode.DUAL) }
+                    Log.i("MainActivity", "尝试重连推理服务")
+                }
             }
         }
-        if (loaded != null) {
-            detector = loaded.first
-            spoofer = loaded.second
-            embedder = loaded.third
-            statusText = "三个模型已就绪"
-            hint = "请输入姓名后点注册"
-        } else {
-            statusText = "模型加载失败：检查 assets/ 下的 onnx 文件"
-        }
-    }
-
-    DisposableEffect(Unit) {
+        router.setMode(RunMode.DUAL)
         onDispose {
+            router.listener = null
             cameraExecutor.shutdown()
-            detector?.close()
-            spoofer?.close()
-            embedder?.close()
         }
     }
 
@@ -180,10 +166,8 @@ fun CameraScreen() {
     )
 
     LaunchedEffect(Unit) {
-        if (!hasPermission) {
-            Log.d("CameraDebug", "发起权限请求")
-            launcher.launch(Manifest.permission.CAMERA)
-        }
+        if (!hasPermission) launcher.launch(Manifest.permission.CAMERA)
+        else statusText = "相机就绪"
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
@@ -193,15 +177,12 @@ fun CameraScreen() {
                     val previewView = PreviewView(ctx).apply {
                         scaleType = PreviewView.ScaleType.FIT_CENTER
                     }
-
                     val providerFuture = ProcessCameraProvider.getInstance(ctx)
                     providerFuture.addListener({
                         val provider = providerFuture.get()
-
                         val preview = Preview.Builder().build().also {
                             it.setSurfaceProvider(previewView.surfaceProvider)
                         }
-
                         val analysis = ImageAnalysis.Builder()
                             .setTargetResolution(android.util.Size(640, 480))
                             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -209,28 +190,64 @@ fun CameraScreen() {
 
                         analysis.setAnalyzer(cameraExecutor) { image ->
                             try {
+                                val captureNs = System.nanoTime()
+                                Trace.beginSection("frame.convert")
                                 val bitmap = image.toUprightBitmap(mirror = true)
+                                Trace.endSection()
+                                val convertDoneNs = System.nanoTime()
                                 frameCounter.incrementAndGet()
 
-                                val d = detector
-                                val s = spoofer
-                                val e = embedder
-                                if (d != null && s != null && e != null &&
-                                    busy.compareAndSet(false, true)
-                                ) {
-                                    try {
-                                        val fr = recognize(bitmap, d, s, e, database)
-                                        mainExecutor.execute {
-                                            frameResult = fr
-                                            frameW = bitmap.width
-                                            frameH = bitmap.height
+                                // 不在这里限制在途帧数：并发额度统一交给推理进程的 Semaphore，
+                                // 这样才能观察到"无限制 vs 有界"的差异
+                                run {
+                                    val reqId = reqSeq.incrementAndGet()
+                                    Trace.beginSection("ipc.analyze")
+                                    val r = router.analyze(bitmap, reqId, captureNs)
+                                    Trace.endSection()
+                                    val ipcReturnNs = System.nanoTime()
+                                    lastFrame.set(bitmap)
+
+                                    mainExecutor.execute {
+                                        val shownNs = System.nanoTime()
+                                        frameResult = r
+                                        frameW = bitmap.width
+                                        frameH = bitmap.height
+                                        if (r.status == FaceResultParcel.STATUS_OK ||
+                                            r.status == FaceResultParcel.STATUS_NO_FACE
+                                        ) {
+                                            val e2e = (shownNs - captureNs) / 1_000_000f
+                                            e2eStats.add(e2e)
+                                            MetricsRecorder.record(
+                                                FrameEvent(
+                                                    requestId = reqId,
+                                                    seq = reqId,
+                                                    captureNs = captureNs,
+                                                    convertDoneNs = convertDoneNs,
+                                                    ipcCallStartNs = convertDoneNs,
+                                                    ipcReturnNs = ipcReturnNs,
+                                                    uiShownNs = shownNs,
+                                                    convertMs = (convertDoneNs - captureNs) / 1_000_000f,
+                                                    ipcRoundMs = (ipcReturnNs - convertDoneNs) / 1_000_000f,
+                                                    serviceWorkMs = r.serviceWorkMs,
+                                                    queueWaitMs = r.queueWaitMs,
+                                                    e2eMs = e2e,
+                                                    detectPreMs = r.detectPreMs,
+                                                    detectInferMs = r.detectInferMs,
+                                                    detectPostMs = r.detectPostMs,
+                                                    spoofMs = r.spoofMs,
+                                                    alignMs = r.alignMs,
+                                                    embedMs = r.embedMs,
+                                                    status = r.status,
+                                                    faceCount = r.faceCount,
+                                                    liveness = r.isReal,
+                                                    mode = router.mode.name
+                                                )
+                                            )
                                         }
-                                    } finally {
-                                        busy.set(false)
                                     }
                                 }
                             } catch (t: Throwable) {
-                                Log.e("CameraDebug", "帧处理失败", t)
+                                Log.e("MainActivity", "帧处理失败", t)
                             } finally {
                                 image.close()
                             }
@@ -241,16 +258,14 @@ fun CameraScreen() {
                             provider.bindToLifecycle(
                                 lifecycleOwner,
                                 CameraSelector.DEFAULT_FRONT_CAMERA,
-                                preview,
-                                analysis
+                                preview, analysis
                             )
-                            Log.d("CameraDebug", "相机绑定成功")
+                            statusText = "相机运行中"
                         } catch (e: Exception) {
-                            Log.e("CameraDebug", "相机绑定异常", e)
+                            Log.e("MainActivity", "相机绑定异常", e)
                             statusText = "相机启动失败: ${e.message}"
                         }
                     }, ContextCompat.getMainExecutor(ctx))
-
                     previewView
                 },
                 modifier = Modifier.fillMaxSize()
@@ -259,48 +274,67 @@ fun CameraScreen() {
 
         FaceOverlay(frameResult, frameW, frameH)
 
-        // 左上角信息面板
         Column(modifier = Modifier.align(Alignment.TopStart).padding(16.dp)) {
-            Text(text = statusText, color = Color.Green, fontSize = 13.sp)
-            Text(text = "FPS: $fps", color = Color.Yellow, fontSize = 13.sp)
-            frameResult?.let { fr ->
-                val r = fr.detect
-                Text(text = "人脸: ${r.detections.size}", color = Color.White, fontSize = 13.sp)
-                // 活体结论
-                val liveness = if (fr.spoof.isReal)
-                    "活体: 通过  ${"%.2f".format(fr.spoof.score)}"
-                else
-                    "活体: 未通过(疑似翻拍)  ${"%.2f".format(fr.spoof.score)}"
-                Text(
-                    text = liveness,
-                    color = if (fr.spoof.isReal) Color(0xFF00E676) else Color(0xFFEF5350),
-                    fontSize = 14.sp
-                )
-                // 识别结论：活体没过就不出识别结果
-                if (fr.spoof.isReal) {
-                    val who = when {
-                        fr.feature == null -> "—"
-                        database.size == 0 -> "库为空，未注册"
-                        fr.name != null -> "识别: ${fr.name}  ${"%.2f".format(fr.similarity)}"
-                        else -> "未知身份  ${"%.2f".format(fr.similarity)}"
-                    }
-                    Text(
-                        text = who,
-                        color = if (fr.name != null) Color(0xFF00E676) else Color(0xFFFFD54F),
-                        fontSize = 15.sp
-                    )
+            Text(
+                "PID ${android.os.Process.myPid()} · ${router.mode.label}",
+                color = Color.Green, fontSize = 12.sp
+            )
+            Text(
+                connText,
+                color = if (svcPid > 0) Color(0xFF00E676) else Color(0xFFEF5350),
+                fontSize = 12.sp
+            )
+            Text(
+                "FPS $fps   E2E avg ${"%.0f".format(e2eAvg)}ms  P95 ${"%.0f".format(e2eP95)}ms",
+                color = Color.Yellow, fontSize = 12.sp
+            )
+
+            frameResult?.let { r ->
+                Text("人脸 ${r.faceCount}   请求 #${r.requestId}", color = Color.White, fontSize = 12.sp)
+                val liveness = when {
+                    r.status == FaceResultParcel.STATUS_DROPPED -> "丢帧（背压）"
+                    r.status == FaceResultParcel.STATUS_TIMEOUT -> "推理超时"
+                    r.status == FaceResultParcel.STATUS_ERROR -> r.statusMessage.ifEmpty { "IPC 异常" }
+                    !r.hasFace -> "画面中无人脸"
+                    r.isReal -> "活体 通过  ${"%.2f".format(r.livenessScore)}"
+                    else -> "活体 未通过（疑似翻拍）${"%.2f".format(r.livenessScore)}"
                 }
                 Text(
-                    text = "检测 ${"%.1f".format(r.preMs)}/${"%.1f".format(r.inferMs)}/${"%.1f".format(r.postMs)}  " +
-                            "活体 ${"%.1f".format(fr.spoof.inferMs)}  " +
-                            "对齐 ${"%.1f".format(fr.alignMs)}  特征 ${"%.1f".format(fr.embedMs)}",
-                    color = Color.Cyan,
-                    fontSize = 11.sp
+                    liveness,
+                    color = when {
+                        !r.isReal -> Color(0xFFEF5350)
+                        r.status != FaceResultParcel.STATUS_OK -> Color(0xFFFFAB91)
+                        else -> Color(0xFF00E676)
+                    },
+                    fontSize = 13.sp
                 )
+                if (r.status == FaceResultParcel.STATUS_OK && r.isReal && r.hasFace) {
+                    val who = when {
+                        r.name != null -> "识别 ${r.name}  ${"%.2f".format(r.similarity)}"
+                        registered.isEmpty() -> "库为空，未注册"
+                        else -> "未知身份  ${"%.2f".format(r.similarity)}"
+                    }
+                    Text(
+                        who,
+                        color = if (r.name != null) Color(0xFF00E676) else Color(0xFFFFD54F),
+                        fontSize = 14.sp
+                    )
+                }
+                if (r.status == FaceResultParcel.STATUS_OK) {
+                    Text(
+                        "检测 ${"%.1f".format(r.detectInferMs)}  活体 ${"%.1f".format(r.spoofMs)}  " +
+                                "对齐 ${"%.1f".format(r.alignMs)}  特征 ${"%.1f".format(r.embedMs)}  服务端 ${"%.1f".format(r.serviceWorkMs)}",
+                        color = Color.Cyan, fontSize = 10.sp
+                    )
+                }
             }
         }
 
-        // 底部：注册区
+        OutlinedButton(
+            onClick = { showDebug = true },
+            modifier = Modifier.align(Alignment.TopEnd).padding(12.dp)
+        ) { Text("调试", fontSize = 12.sp) }
+
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -318,7 +352,7 @@ fun CameraScreen() {
                     onValueChange = { nameInput = it },
                     label = { Text("姓名", fontSize = 12.sp) },
                     singleLine = true,
-                    modifier = Modifier.width(140.dp),
+                    modifier = Modifier.width(130.dp),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = Color.White,
                         unfocusedTextColor = Color.White,
@@ -329,94 +363,62 @@ fun CameraScreen() {
                         unfocusedBorderColor = Color.Gray
                     )
                 )
-                Button(
-                    onClick = {
-                        val feat = frameResult?.feature
-                        if (feat == null) {
-                            hint = "画面里还没有通过活体检测的人脸"
-                        } else if (nameInput.isBlank()) {
-                            hint = "请先输入姓名"
-                        } else {
-                            database.register(nameInput, feat)
-                            registered = database.names()
-                            hint = "已注册 ${nameInput.trim()}，共 ${database.size} 人"
-                            focusManager.clearFocus()
+                Button(onClick = {
+                    val bmp = lastFrame.get()
+                    if (bmp == null) {
+                        hint = "还没有可用帧"
+                    } else if (nameInput.isBlank()) {
+                        hint = "请先输入姓名"
+                    } else {
+                        hint = "注册中…"
+                        focusManager.clearFocus()
+                        val wanted = nameInput.trim()
+                        cameraExecutor.execute {
+                            val id = reqSeq.incrementAndGet()
+                            Trace.beginSection("ipc.register")
+                            val r = router.register(bmp, wanted, id)
+                            Trace.endSection()
+                            mainExecutor.execute {
+                                hint = if (r.status == FaceResultParcel.STATUS_OK) {
+                                    registered = router.names()
+                                    "已注册 $wanted，共 ${registered.size} 人"
+                                } else {
+                                    "注册失败：${r.statusMessage.ifEmpty { "status=${r.status}" }}"
+                                }
+                            }
                         }
                     }
-                ) { Text("注册当前人脸", fontSize = 12.sp) }
+                }) { Text("注册", fontSize = 12.sp) }
 
-                OutlinedButton(
-                    onClick = {
-                        database.clear()
-                        registered = emptyList()
-                        hint = "特征库已清空"
+                OutlinedButton(onClick = {
+                    cameraExecutor.execute {
+                        router.clearDatabase()
+                        mainExecutor.execute {
+                            registered = emptyList()
+                            hint = "特征库已清空"
+                        }
                     }
-                ) { Text("清空", fontSize = 12.sp) }
+                }) { Text("清空", fontSize = 12.sp) }
             }
             Text(
-                text = if (registered.isEmpty()) "已注册：无" else "已注册：${registered.joinToString("、")}",
-                color = Color.LightGray,
-                fontSize = 12.sp,
-                modifier = Modifier.padding(top = 6.dp)
+                if (registered.isEmpty()) "已注册：无" else "已注册：${registered.joinToString("、")}",
+                color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)
             )
-            if (hint.isNotEmpty()) {
-                Text(text = hint, color = Color(0xFFFFD54F), fontSize = 12.sp)
+            if (hint.isNotEmpty()) Text(hint, color = Color(0xFFFFD54F), fontSize = 11.sp)
+        }
+
+        // 调试页做成覆盖层而不是新 Activity：否则 MainActivity 进入 stop，
+        // CameraX 停止出帧，调试页上的队列/信号量数据会立刻变成 0
+        if (showDebug) {
+            Box(modifier = Modifier.fillMaxSize().background(Color(0xFF101418))) {
+                DebugScreen(onClose = { showDebug = false })
             }
         }
     }
 }
 
-/**
- * 检测 -> 活体 -> 识别 一条龙。跑在摄像头分析线程上。
- *
- * 活体没通过时直接短路返回，不做对齐和特征提取——
- * 一来省算力，二来安全语义清晰：翻拍的脸不允许进入注册/识别环节。
- */
-private fun recognize(
-    bitmap: Bitmap,
-    detector: ScrfdDetector,
-    spoof: AntiSpoofDetector,
-    embedder: FaceEmbedder,
-    database: FaceDatabase
-): FrameResult {
-    val r = detector.detect(bitmap)
-    val face = r.largest()
-        ?: return FrameResult(
-            r, AntiSpoofDetector.Result(true, 0f, 0f, 0f),
-            null, 0f, null, 0f, 0f
-        )
-
-    val sp = spoof.detect(bitmap, face.x1, face.y1, face.x2, face.y2)
-    if (!sp.isReal) {
-        return FrameResult(r, sp, null, 0f, null, 0f, 0f)
-    }
-
-    val t0 = System.nanoTime()
-    val aligned = FaceAligner.align(bitmap, face.landmarks)
-    val t1 = System.nanoTime()
-    val feature = embedder.embed(aligned)
-    val t2 = System.nanoTime()
-
-    val m = database.match(feature)
-    val name = if (m != null && m.similarity >= FaceEmbedder.MATCH_THRESHOLD) m.name else null
-
-    return FrameResult(
-        detect = r,
-        spoof = sp,
-        name = name,
-        similarity = m?.similarity ?: 0f,
-        feature = feature,
-        alignMs = (t1 - t0) / 1_000_000f,
-        embedMs = (t2 - t1) / 1_000_000f
-    )
-}
-
-/**
- * 把检测框、关键点、活体与识别结论画在预览上面。
- * 颜色语义：活体通过且识别到 = 绿；活体通过未识别 = 橙；活体未通过 = 红。
- */
 @Composable
-fun FaceOverlay(fr: FrameResult?, frameW: Int, frameH: Int) {
+fun FaceOverlay(r: FaceResultParcel?, frameW: Int, frameH: Int) {
     val textPaint = remember {
         Paint().apply {
             isAntiAlias = true
@@ -426,69 +428,63 @@ fun FaceOverlay(fr: FrameResult?, frameW: Int, frameH: Int) {
         }
     }
     Canvas(modifier = Modifier.fillMaxSize()) {
-        val res = fr ?: return@Canvas
-        if (frameW <= 0 || frameH <= 0) return@Canvas
+        val res = r ?: return@Canvas
+        if (frameW <= 0 || frameH <= 0 || !res.hasFace) return@Canvas
 
         val scale = min(size.width / frameW, size.height / frameH)
         val dx = (size.width - frameW * scale) / 2f
         val dy = (size.height - frameH * scale) / 2f
-        val largest = res.detect.largest()
 
-        res.detect.detections.forEach { d ->
-            val isLargest = d === largest
-            val boxColor = when {
-                isLargest && !res.spoof.isReal -> Color(0xFFEF5350)   // 红：非活体
-                isLargest && res.name != null -> Color(0xFF00E676)    // 绿：已识别
-                else -> Color(0xFFFFA726)                             // 橙：未识别
-            }
-
-            drawRect(
-                color = boxColor,
-                topLeft = Offset(dx + d.x1 * scale, dy + d.y1 * scale),
-                size = Size(d.width * scale, d.height * scale),
-                style = Stroke(width = 4f)
+        val boxColor = when {
+            !res.isReal -> Color(0xFFEF5350)
+            res.name != null -> Color(0xFF00E676)
+            else -> Color(0xFFFFA726)
+        }
+        drawRect(
+            color = boxColor,
+            topLeft = Offset(dx + res.x1 * scale, dy + res.y1 * scale),
+            size = Size(res.width * scale, res.height * scale),
+            style = Stroke(width = 4f)
+        )
+        var i = 0
+        while (i + 1 < res.landmarks.size) {
+            drawCircle(
+                color = Color(0xFFFF5252),
+                radius = 5f,
+                center = Offset(dx + res.landmarks[i] * scale, dy + res.landmarks[i + 1] * scale)
             )
-            var i = 0
-            while (i + 1 < d.landmarks.size) {
-                drawCircle(
-                    color = Color(0xFFFF5252),
-                    radius = 5f,
-                    center = Offset(dx + d.landmarks[i] * scale, dy + d.landmarks[i + 1] * scale)
-                )
-                i += 2
-            }
+            i += 2
         }
 
-        if (largest != null) {
-            val label = when {
-                !res.spoof.isReal -> "疑似翻拍  ${"%.2f".format(res.spoof.score)}"
-                res.name != null -> "${res.name}  ${"%.2f".format(res.similarity)}"
-                res.feature == null -> ""
-                else -> "未知  ${"%.2f".format(res.similarity)}"
+        val label = when {
+            res.status != FaceResultParcel.STATUS_OK -> ""
+            !res.isReal -> "疑似翻拍 ${"%.2f".format(res.livenessScore)}"
+            res.name != null -> "${res.name} ${"%.2f".format(res.similarity)}"
+            else -> "未知 ${"%.2f".format(res.similarity)}"
+        }
+        if (label.isNotEmpty()) {
+            textPaint.color = when {
+                !res.isReal -> 0xFFEF5350.toInt()
+                res.name != null -> 0xFF00E676.toInt()
+                else -> 0xFFFFA726.toInt()
             }
-            if (label.isNotEmpty()) {
-                textPaint.color = when {
-                    !res.spoof.isReal -> 0xFFEF5350.toInt()
-                    res.name != null -> 0xFF00E676.toInt()
-                    else -> 0xFFFFA726.toInt()
-                }
-                val x = dx + largest.x1 * scale
-                val y = (dy + largest.y1 * scale - 12f).coerceAtLeast(40f)
-                drawContext.canvas.nativeCanvas.drawText(label, x, y, textPaint)
-            }
+            drawContext.canvas.nativeCanvas.drawText(
+                label,
+                dx + res.x1 * scale,
+                (dy + res.y1 * scale - 12f).coerceAtLeast(40f),
+                textPaint
+            )
         }
     }
 }
 
-/** ImageProxy（生的 YUV 帧）→ 摆正 + 镜像后的 Bitmap */
+/** ImageProxy（YUV 帧）→ 摆正 + 镜像后的 Bitmap */
 fun ImageProxy.toUprightBitmap(mirror: Boolean): Bitmap {
     val src = toBitmap()
-
     val matrix = Matrix()
     val rot = imageInfo.rotationDegrees
     if (rot != 0) matrix.postRotate(rot.toFloat())
     if (mirror) matrix.postScale(-1f, 1f)
-
     return if (matrix.isIdentity) src
     else Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
 }

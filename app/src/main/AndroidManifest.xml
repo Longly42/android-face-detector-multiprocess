@@ -8,6 +8,7 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <application
+        android:name=".FaceApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -27,6 +28,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          独立推理进程：android:process=":inference"
+          该进程只跑模型与特征库，通过 AIDL 与主进程通信。
+        -->
+        <service
+            android:name=".inference.InferenceService"
+            android:exported="false"
+            android:process=":inference" />
     </application>
 
 </manifest>

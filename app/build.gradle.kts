@@ -11,7 +11,8 @@ android {
 
     defaultConfig {
         applicationId = "com.example.androidfacedetector"
-        minSdk = 26
+        // 27：跨进程传帧用 android.os.SharedMemory（API 27 起提供）
+        minSdk = 27
         targetSdk = 37
         versionCode = 1
         versionName = "1.0"
@@ -33,6 +34,7 @@ android {
     }
     buildFeatures {
         compose = true
+        aidl = true
     }
 }
 
