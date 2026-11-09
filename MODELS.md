@@ -61,6 +61,47 @@ onnx.save(m, "scrfd_500m_bnkps_shape640x640.onnx")
 
 同人与不同人之间存在 0.23 ~ 0.86 的明显间隔，故取阈值 **0.5**（偏严，宁可拒识不误识）。
 
+### 活体检测：MiniFASNetV2 + MiniFASNetV1SE（双模型融合）
+
+| 项 | 内容 |
+|---|---|
+| 文件 | `app/src/main/assets/antispoof_minifasnetv2_80x80.onnx`（1.74 MB）、`antispoof_minifasnetv1se_80x80.onnx`（1.74 MB） |
+| 来源 | minivision-ai/Silent-Face-Anti-Spoofing（MIT 许可），`resources/anti_spoof_models/` 下的 `2.7_80x80_MiniFASNetV2.pth` 与 `4_0_0_80x80_MiniFASNetV1SE.pth` |
+| 地址 | https://github.com/minivision-ai/Silent-Face-Anti-Spoofing |
+| 输入 | `input`，`1 × 3 × 80 × 80`，float32，**BGR、0~255 原始亮度（不归一化）** |
+| 输出 | `logits`，3 类 → softmax，官方约定 argmax==1 为真脸 |
+| 融合 | 两个模型的 softmax 概率逐类相加后取 argmax，分数除以模型数 |
+| 裁剪 | 按模型文件名里的 scale（2.7 / 4.0）以人脸框中心向外扩，resize 到 80×80，用 cv2 语义的 INTER_LINEAR（中心对齐、无抗锯齿） |
+| 许可 | MIT（代码），模型权重随工程发布，仅用于课程实验 |
+
+**三个最容易踩的坑**（都已实测踩过）：
+
+1. **输入不归一化**。官方 `src/data_io/functional.py` 的 `to_tensor` 被改为不除 255
+   （源码注释 "modify by zkx"）。按 0~1 输入时官方样例三张全判错；按 0~255 输入后
+   官方样例判定全部与官方一致。
+2. **裁剪缩放不能用平台默认双线性**。Android `createScaledBitmap(filter=true)` 与
+   PIL 的 BILINEAR（自带抗锯齿）行为不同，会显著改变模型置信度。必须手写
+   cv2 的中心对齐 INTER_LINEAR：`src = (dst + 0.5) * srcSize / dstSize - 0.5`。
+3. **双模型融合必须累加**。softmax 结果逐类相加后 argmax；若后一个模型覆盖前一个，
+   分数会大幅偏离（实测 0.998 → 0.497）。
+
+**导出方式**：`torch.onnx.export(..., opset_version=11, dynamo=False)`。
+注意 torch 2.9+ 默认的 dynamo 导出器产出 opset 18 / IR 10 的模型，在
+ORT Android 1.20 上以字节流方式加载会报 `model_path must not be empty`
+（optimizer 阶段初始化 TensorProto 走了文件路径分支），改用传统 TorchScript
+导出器（opset 11 / IR 6，与本项目另两个模型一致）后正常。
+
+**阈值标定**（官方样例 + 实拍，PC 与端侧一致）：
+
+| 样例 | 官方预期 | 判定 | score |
+|---|---|---|---|
+| image_T1.jpg（真脸） | Real | REAL | 0.998 |
+| image_F1.jpg（打印照片攻击） | Fake | FAKE | 0.724 |
+| image_F2.jpg（屏幕翻拍攻击） | Fake | FAKE | 0.996 |
+
+判定规则直接沿用官方：argmax==1 为真脸，无额外阈值；两次类别"翻转"
+（0/2）都算假脸，这比二分类阈值更保守。
+
 ## 计划接入
 
 | 用途 | 模型 | 备注 |
