@@ -41,6 +41,9 @@ interface IFaceInference {
      */
     void configure(int threads, int permits);
 
+    /** 切换检测输入分辨率（640 / 320），第 7 周模型侧对照实验 */
+    void setDetectResolution(int size);
+
     void clearDatabase();
 
     List<String> listNames();

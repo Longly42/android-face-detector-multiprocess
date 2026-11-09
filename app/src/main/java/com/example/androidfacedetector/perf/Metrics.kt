@@ -133,12 +133,13 @@ object MetricsRecorder {
     fun clear() = events.clear()
 
     /** 导出 CSV，返回文件；路径在 filesDir/metrics/ 下 */
-    fun exportCsv(context: Context): File? {
+    fun exportCsv(context: Context, tag: String = ""): File? {
         val list = snapshot()
         if (list.isEmpty()) return null
         val dir = File(context.filesDir, "metrics").apply { mkdirs() }
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val file = File(dir, "frames_$stamp.csv")
+        val safe = tag.replace(Regex("[^A-Za-z0-9_=.-]"), "_")
+        val file = File(dir, if (safe.isEmpty()) "frames_$stamp.csv" else "frames_${safe}_$stamp.csv")
         val header = "requestId,seq,mode,status,faces,liveness," +
                 "e2e_ms,convert_ms,ipc_ms,queue_wait_ms,service_work_ms," +
                 "detect_pre_ms,detect_infer_ms,detect_post_ms,spoof_ms,align_ms,embed_ms," +

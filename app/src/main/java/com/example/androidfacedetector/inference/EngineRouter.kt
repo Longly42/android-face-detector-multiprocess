@@ -34,6 +34,21 @@ class EngineRouter(private val context: Context) : Closeable {
     var mode: RunMode = RunMode.DUAL
         private set
 
+    /**
+     * 跳帧倍率：1 = 每帧都分析；2 = 每两帧分析一次。
+     * 第 7 周系统侧优化项，用来观察"降低分析频率换稳定性"的取舍。
+     */
+    @Volatile
+    var frameSkip: Int = 1
+
+    /** 当前检测输入边长，用于给导出数据打标签 */
+    @Volatile
+    var detectSize: Int = 640
+        private set
+
+    /** 形如 DUAL_det640_skip1，导出 CSV 时拼进文件名 */
+    fun configTag(): String = "${mode.name}_det${detectSize}_skip${frameSkip}"
+
     @Volatile
     var localReady: Boolean = false
         private set
@@ -160,6 +175,14 @@ class EngineRouter(private val context: Context) : Closeable {
     fun names(): List<String> = when (mode) {
         RunMode.DUAL -> client?.listNames() ?: emptyList()
         RunMode.SINGLE -> local?.names ?: emptyList()
+    }
+
+    fun setDetectResolution(size: Int) {
+        detectSize = size
+        when (mode) {
+            RunMode.DUAL -> client?.setDetectResolution(size)
+            RunMode.SINGLE -> local?.setDetectResolution(size)
+        }
     }
 
     fun clearDatabase() {

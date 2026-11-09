@@ -29,7 +29,26 @@ class InferenceEngine(context: Context) : Closeable {
 
     private val appContext = context.applicationContext
 
-    private val detector = ScrfdDetector(appContext, threads = 2)
+    /** 切换检测输入分辨率：640（默认）或 320。模型文件不同，需要重建 session */
+    @Synchronized
+    fun setDetectResolution(size: Int) {
+        if (size == detectSize) return
+        val asset = if (size == 320) "scrfd_500m_bnkps_shape320x320.onnx"
+        else "scrfd_500m_bnkps_shape640x640.onnx"
+        val old = detector
+        detector = ScrfdDetector(appContext, modelAsset = asset, threads = 2, inputSize = size)
+        detectSize = size
+        old.close()
+        Log.i(TAG, "检测分辨率切换为 $size ($asset)")
+    }
+
+    val currentDetectSize: Int get() = detectSize
+
+    @Volatile
+    private var detectSize = 640
+
+    @Volatile
+    private var detector = ScrfdDetector(appContext, threads = 2, inputSize = 640)
     private val spoof = AntiSpoofDetector(appContext, threads = 2)
     private val embedder = FaceEmbedder(appContext, threads = 2)
     private val database = FaceDatabase(appContext)

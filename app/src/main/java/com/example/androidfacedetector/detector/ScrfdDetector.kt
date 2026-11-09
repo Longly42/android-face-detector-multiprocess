@@ -29,13 +29,14 @@ import kotlin.math.sqrt
 class ScrfdDetector(
     context: Context,
     modelAsset: String = DEFAULT_MODEL,
-    threads: Int = 2
+    threads: Int = 2,
+    /** 模型输入边长：640（默认）或 320（第 7 周分辨率对照实验用） */
+    private val inputSize: Int = 640
 ) {
 
     companion object {
         const val DEFAULT_MODEL = "scrfd_500m_bnkps_shape640x640.onnx"
         private const val TAG = "Scrfd"
-        private const val INPUT_SIZE = 640
         private const val NUM_ANCHORS = 2   // SCRFD 每个格子放 2 个锚点
     }
 
@@ -44,12 +45,12 @@ class ScrfdDetector(
     private val inputName: String
 
     // ---- 复用缓冲，避免每帧都 new 一堆对象（不然 GC 会拖慢帧率）----
-    private val inputBitmap = Bitmap.createBitmap(INPUT_SIZE, INPUT_SIZE, Bitmap.Config.ARGB_8888)
+    private val inputBitmap = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
     private val inputCanvas = Canvas(inputBitmap)
     private val drawPaint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val pixels = IntArray(INPUT_SIZE * INPUT_SIZE)
-    private val inputData = FloatArray(3 * INPUT_SIZE * INPUT_SIZE)
-    private val plane = INPUT_SIZE * INPUT_SIZE
+    private val pixels = IntArray(inputSize * inputSize)
+    private val inputData = FloatArray(3 * inputSize * inputSize)
+    private val plane = inputSize * inputSize
 
     init {
         val bytes = context.assets.open(modelAsset).use { it.readBytes() }
@@ -103,7 +104,7 @@ class ScrfdDetector(
         val tensor = OnnxTensor.createTensor(
             env,
             FloatBuffer.wrap(inputData),
-            longArrayOf(1, 3, INPUT_SIZE.toLong(), INPUT_SIZE.toLong())
+            longArrayOf(1, 3, inputSize.toLong(), inputSize.toLong())
         )
         var output: OrtSession.Result? = null
         try {
@@ -137,10 +138,10 @@ class ScrfdDetector(
         val newW: Int
         val newH: Int
         if (imRatio > 1f) {                 // 竖图：高度顶满
-            newH = INPUT_SIZE
+            newH = inputSize
             newW = (newH / imRatio).toInt().coerceAtLeast(1)
         } else {                            // 横图：宽度顶满
-            newW = INPUT_SIZE
+            newW = inputSize
             newH = (newW * imRatio).toInt().coerceAtLeast(1)
         }
         val scale = newH.toFloat() / src.height
@@ -149,7 +150,7 @@ class ScrfdDetector(
         inputCanvas.drawColor(Color.BLACK)
         inputCanvas.drawBitmap(src, null, Rect(0, 0, newW, newH), drawPaint)
 
-        inputBitmap.getPixels(pixels, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE)
+        inputBitmap.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
 
         // 归一化：(像素 - 127.5) / 128，并拆成 R/G/B 三个平面（模型要 NCHW 布局）
         var i = 0
@@ -225,7 +226,7 @@ class ScrfdDetector(
             val cells = n / NUM_ANCHORS
             val feature = sqrt(cells.toFloat()).roundToInt()
             if (feature * feature != cells) continue      // 不是方块特征图，跳过
-            val stride = INPUT_SIZE.toFloat() / feature   // 80格 -> 8, 40格 -> 16, 20格 -> 32
+            val stride = inputSize.toFloat() / feature   // 80格 -> 8, 40格 -> 16, 20格 -> 32
 
             for (idx in 0 until n) {
                 val score = scores[idx]

@@ -190,12 +190,16 @@ fun CameraScreen() {
 
                         analysis.setAnalyzer(cameraExecutor) { image ->
                             try {
+                                // 跳帧：在转换之前判断，连 YUV->Bitmap 的开销一起省掉
+                                val seqNo = frameCounter.incrementAndGet()
+                                val skip = router.frameSkip
+                                if (skip > 1 && seqNo % skip != 0) return@setAnalyzer
+
                                 val captureNs = System.nanoTime()
                                 Trace.beginSection("frame.convert")
                                 val bitmap = image.toUprightBitmap(mirror = true)
                                 Trace.endSection()
                                 val convertDoneNs = System.nanoTime()
-                                frameCounter.incrementAndGet()
 
                                 // 不在这里限制在途帧数：并发额度统一交给推理进程的 Semaphore，
                                 // 这样才能观察到"无限制 vs 有界"的差异

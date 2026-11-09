@@ -173,6 +173,32 @@ fun DebugScreen(onClose: () -> Unit) {
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (sz in listOf(640, 320)) {
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                withContext(Dispatchers.IO) { router.setDetectResolution(sz) }
+                                note = "检测输入分辨率 = $sz（重建推理会话）"
+                            }
+                        },
+                        modifier = Modifier.width(120.dp)
+                    ) { Text("检测$sz", fontSize = 12.sp) }
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (k in listOf(1, 2, 4)) {
+                    OutlinedButton(
+                        onClick = {
+                            router.frameSkip = k
+                            note = if (k == 1) "跳帧关闭（每帧都分析）" else "每 $k 帧分析一次"
+                        },
+                        modifier = Modifier.width(84.dp)
+                    ) { Text("跳帧$k", fontSize = 12.sp) }
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 for (p in listOf(1, 2, 4)) {
                     OutlinedButton(
                         onClick = {
@@ -192,7 +218,8 @@ fun DebugScreen(onClose: () -> Unit) {
                 Button(onClick = {
                     scope.launch {
                         withContext(Dispatchers.IO) { router.resetStats() }
-                        note = "统计已清零"
+                        MetricsRecorder.clear()
+                        note = "统计与帧记录已清零"
                     }
                 }) { Text("清零", fontSize = 12.sp) }
 
@@ -205,7 +232,9 @@ fun DebugScreen(onClose: () -> Unit) {
 
                 OutlinedButton(onClick = {
                     scope.launch {
-                        val f = withContext(Dispatchers.IO) { MetricsRecorder.exportCsv(context) }
+                        val f = withContext(Dispatchers.IO) {
+                            MetricsRecorder.exportCsv(context, router.configTag())
+                        }
                         note = if (f != null) "已导出：${f.absolutePath}" else "暂无数据可导出"
                     }
                 }) { Text("导出CSV", fontSize = 12.sp) }

@@ -170,6 +170,10 @@ class InferenceService : Service() {
             Log.i(TAG, "配置更新: 线程数=$t, 许可数=$p")
         }
 
+        override fun setDetectResolution(size: Int) {
+            engine?.setDetectResolution(size)
+        }
+
         override fun clearDatabase() {
             engine?.clearDatabase()
         }

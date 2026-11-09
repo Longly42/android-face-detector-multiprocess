@@ -196,6 +196,14 @@ class FaceClient(private val context: Context) : Closeable {
         }
     }
 
+    fun setDetectResolution(size: Int) {
+        try {
+            remote?.setDetectResolution(size)
+        } catch (t: Throwable) {
+            Log.w(TAG, "setDetectResolution 失败", t)
+        }
+    }
+
     fun clearDatabase() {
         try {
             remote?.clearDatabase()
