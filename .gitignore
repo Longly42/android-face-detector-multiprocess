@@ -16,3 +16,6 @@ local.properties
 .tmp_model/
 /.idea/
 .kotlin/
+
+# PPT 渲染中间产物
+.tmp_ppt/
